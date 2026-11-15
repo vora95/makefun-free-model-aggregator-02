@@ -105,62 +105,110 @@ export interface Capabilities {
   json: boolean | null;
 }
 
+/**
+ * A cursor over the brief's text that finds JSON objects one `{` at a
+ * time. Every `{` is tried as an opening brace, in order — nested objects
+ * included — so a document buried inside another still turns up. A `{`
+ * whose braces never balance, or whose text is not JSON, is skipped and the
+ * scan moves on to the next one.
+ */
+class BraceScanner {
+  private readonly text: string;
+  private pos = 0;
+
+  constructor(text: string) {
+    this.text = text;
+  }
+
+  /** The next `{` at or after the cursor, or -1 when there is none. */
+  private nextOpen(): number {
+    const at = this.text.indexOf('{', this.pos);
+    this.pos = at === -1 ? this.text.length : at;
+    return at;
+  }
+
+  /**
+   * The index of the `}` closing the object that opens at `start`, or -1.
+   * String contents are skipped, and a backslash inside a string escapes
+   * the character after it, so a brace inside a string never counts.
+   */
+  private matchingClose(start: number): number {
+    let depth = 0;
+    let inString = false;
+    for (let i = start; i < this.text.length; i += 1) {
+      const ch = this.text[i];
+      if (inString) {
+        if (ch === '\\') i += 1;
+        else if (ch === '"') inString = false;
+        continue;
+      }
+      if (ch === '"') inString = true;
+      else if (ch === '{') depth += 1;
+      else if (ch === '}') {
+        depth -= 1;
+        if (depth === 0) return i;
+      }
+    }
+    return -1;
+  }
+
+  /** The next JSON object in the text, or null when the text holds no more. */
+  nextObject(): Json | null {
+    for (;;) {
+      const start = this.nextOpen();
+      if (start === -1) return null;
+      this.pos = start + 1;
+      const end = this.matchingClose(start);
+      if (end === -1) continue;
+      try {
+        const value: unknown = JSON.parse(this.text.slice(start, end + 1));
+        if (isRecord(value)) return value;
+      } catch {
+        // Not JSON on its own: look on.
+      }
+    }
+  }
+}
+
 /** Every JSON object in `text` that carries a string `schema`, in the order they appear. */
 function documentsIn(text: string): Json[] {
+  const scanner = new BraceScanner(text);
   const out: Json[] = [];
-  for (let start = text.indexOf('{'); start !== -1; start = text.indexOf('{', start + 1)) {
-    const end = objectEnd(text, start);
-    if (end === -1) continue;
-    try {
-      const value: unknown = JSON.parse(text.slice(start, end + 1));
-      if (isRecord(value) && typeof value.schema === 'string') out.push(value);
-    } catch {
-      // Not JSON on its own: look on.
-    }
+  let doc: Json | null;
+  while ((doc = scanner.nextObject()) !== null) {
+    if (typeof doc.schema === 'string') out.push(doc);
   }
   return out;
 }
 
-/** The index of the `}` closing the object that opens at `start`, or -1; string contents are skipped. */
-function objectEnd(text: string, start: number): number {
-  let depth = 0;
-  let inString = false;
-  for (let i = start; i < text.length; i++) {
-    const ch = text[i];
-    if (inString) {
-      if (ch === '\\') i += 1;
-      else if (ch === '"') inString = false;
-    } else if (ch === '"') inString = true;
-    else if (ch === '{') depth += 1;
-    else if (ch === '}') {
-      depth -= 1;
-      if (depth === 0) return i;
-    }
-  }
-  return -1;
+/** A field as a string, or '' when it is missing or not one. */
+function strField(row: Json, key: string): string {
+  return typeof row[key] === 'string' ? (row[key] as string) : '';
 }
 
-function stringOf(v: unknown): string {
-  return typeof v === 'string' ? v : '';
-}
-
-function numberOrNull(v: unknown): number | null {
+/** A field as a finite number, or null when it is missing or not one. */
+function numField(row: Json, key: string): number | null {
+  const v = row[key];
   return typeof v === 'number' && Number.isFinite(v) ? v : null;
 }
 
-function boolOrNull(v: unknown): boolean | null {
+/** A field as a boolean, or null when it is missing or not one. */
+function boolField(row: Json, key: string): boolean | null {
+  const v = row[key];
   return typeof v === 'boolean' ? v : null;
 }
 
 /**
- * The first document under this contest's prefix that carries one of `keys` as an array: the document
- * and the key it was found under. A brief that spells its lists in the sibling's names still reads.
+ * The first document under this contest's prefix that carries one of
+ * `keys` as an array: the array itself. A brief that spells its lists in
+ * the sibling's names still reads.
  */
-function arrayDocument(docs: readonly Json[], keys: readonly string[]): { doc: Json; key: string } | null {
+function firstList(docs: readonly Json[], keys: readonly string[]): unknown[] | null {
   for (const doc of docs) {
-    const schema = stringOf(doc.schema);
-    if (!schema.includes(SCHEMA_PREFIX)) continue;
-    for (const key of keys) if (Array.isArray(doc[key])) return { doc, key };
+    if (!strField(doc, 'schema').includes(SCHEMA_PREFIX)) continue;
+    for (const key of keys) {
+      if (Array.isArray(doc[key])) return doc[key] as unknown[];
+    }
   }
   return null;
 }
@@ -173,39 +221,45 @@ function arrayDocument(docs: readonly Json[], keys: readonly string[]): { doc: J
  */
 function modelOf(v: unknown): ModelRow | null {
   if (!isRecord(v)) return null;
-  const raw = stringOf(v.id) !== '' ? stringOf(v.id) : stringOf(v.model);
+  const raw = strField(v, 'id') !== '' ? strField(v, 'id') : strField(v, 'model');
   if (raw === '') return null;
-  const named = stringOf(v.provider) !== '' ? stringOf(v.provider) : stringOf(v.wire);
+  const named = strField(v, 'provider') !== '' ? strField(v, 'provider') : strField(v, 'wire');
   const id = named === 'openrouter' && !raw.toLowerCase().startsWith('openrouter/') ? `openrouter/${raw}` : raw;
   return {
     id,
     provider: named === '' ? 'openrouter' : named,
-    display_name: stringOf(v.display_name) !== '' ? stringOf(v.display_name) : raw,
-    rating_milli: numberOrNull(v.rating_milli) ?? 0,
-    context_length: numberOrNull(v.context_length),
-    tools: boolOrNull(v.tools),
-    vision: boolOrNull(v.vision),
-    json: boolOrNull(v.json),
+    display_name: strField(v, 'display_name') !== '' ? strField(v, 'display_name') : raw,
+    rating_milli: numField(v, 'rating_milli') ?? 0,
+    context_length: numField(v, 'context_length'),
+    tools: boolField(v, 'tools'),
+    vision: boolField(v, 'vision'),
+    json: boolField(v, 'json'),
     free: v.free !== false,
   };
 }
 
+/** The requirements one prompt row names, as a Requirement: only the flags the row sets. */
+function requirementsOf(v: Json): Requirement {
+  const requires = isRecord(v.requires) ? v.requires : {};
+  const out: Requirement = {};
+  if (requires.tools === true) out.tools = true;
+  if (requires.vision === true) out.vision = true;
+  if (requires.json === true) out.json = true;
+  const minContext = numField(requires, 'min_context');
+  if (minContext !== null) out.min_context = minContext;
+  return out;
+}
+
 function promptOf(v: unknown): PromptRow | null {
   if (!isRecord(v)) return null;
-  const id = stringOf(v.id);
+  const id = strField(v, 'id');
   if (id === '') return null;
-  const requires = isRecord(v.requires) ? v.requires : {};
   return {
     id,
     api: v.api === 'anthropic' ? 'anthropic' : 'openai',
     stream: v.stream === true,
     weight: v.weight === 2 ? 2 : 1,
-    requires: {
-      ...(requires.tools === true ? { tools: true } : {}),
-      ...(requires.vision === true ? { vision: true } : {}),
-      ...(requires.json === true ? { json: true } : {}),
-      ...(typeof requires.min_context === 'number' && Number.isFinite(requires.min_context) ? { min_context: requires.min_context } : {}),
-    },
+    requires: requirementsOf(v),
   };
 }
 
@@ -219,22 +273,24 @@ export function readBrief(path: string): Brief {
     return { models: [], prompts: [], error: `cannot read ${path}: ${(err as Error).message}` };
   }
   const docs = documentsIn(text);
-  const modelsDoc = arrayDocument(docs, ['models', 'ratings']);
-  if (modelsDoc === null) {
+  const modelsList = firstList(docs, ['models', 'ratings']);
+  if (modelsList === null) {
     return { models: [], prompts: [], error: `the brief at ${path} holds no ${MODELS_SCHEMA} document` };
   }
-  const models = (modelsDoc.doc[modelsDoc.key] as unknown[]).flatMap((v) => {
+  const models: ModelRow[] = [];
+  for (const v of modelsList) {
     const m = modelOf(v);
-    return m === null ? [] : [m];
-  });
-  const promptsDoc = arrayDocument(docs, ['prompts', 'manifest']);
-  if (promptsDoc === null) {
+    if (m !== null) models.push(m);
+  }
+  const promptsList = firstList(docs, ['prompts', 'manifest']);
+  if (promptsList === null) {
     return { models, prompts: [], error: `the brief at ${path} holds no ${PROMPTS_SCHEMA} document` };
   }
-  const prompts = (promptsDoc.doc[promptsDoc.key] as unknown[]).flatMap((v) => {
+  const prompts: PromptRow[] = [];
+  for (const v of promptsList) {
     const p = promptOf(v);
-    return p === null ? [] : [p];
-  });
+    if (p !== null) prompts.push(p);
+  }
   return { models, prompts, error: null };
 }
 
@@ -253,12 +309,22 @@ export function capabilitiesOf(model: ModelRow): Capabilities {
   };
 }
 
-/** Whether a model's capabilities meet one prompt's requirements. An unknown capability never meets one. */
+/**
+ * Whether a model's capabilities meet one prompt's requirements. An unknown capability never meets one.
+ * Each requirement is one check; the first one the model fails decides the answer.
+ */
 export function meetsRequirements(requires: Requirement, caps: Capabilities): boolean {
-  if (requires.tools === true && caps.tools !== true) return false;
-  if (requires.vision === true && caps.vision !== true) return false;
-  if (requires.json === true && caps.json !== true) return false;
-  if (requires.min_context !== undefined && (caps.context_length === null || caps.context_length < requires.min_context)) return false;
+  const checks: Array<[boolean, boolean]> = [
+    [requires.tools === true, caps.tools === true],
+    [requires.vision === true, caps.vision === true],
+    [requires.json === true, caps.json === true],
+  ];
+  for (const [needed, met] of checks) {
+    if (needed && !met) return false;
+  }
+  if (requires.min_context !== undefined) {
+    if (caps.context_length === null || caps.context_length < requires.min_context) return false;
+  }
   return true;
 }
 
@@ -274,8 +340,8 @@ export function meetsRequirements(requires: Requirement, caps: Capabilities): bo
  * exactly that set, since listing fewer loses the column as surely as listing more.
  */
 export function buildCatalog(brief: Brief): CatalogReport {
-  const seen = new Set<string>();
   const models: CatalogModel[] = [];
+  const seen = new Set<string>();
   for (const model of brief.models) {
     if (!model.free || seen.has(model.id)) continue;
     seen.add(model.id);

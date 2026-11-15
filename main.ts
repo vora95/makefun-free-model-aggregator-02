@@ -1,32 +1,24 @@
-// free-model-aggregator-02 — PRACTICE entry, policy A (Xingchi backend).
+// free-model-aggregator-02 — policy A: the best free model behind one server.
 //
-// PRACTICE ONLY. Written fresh for local training against the kit's
-// practice trials, built on the kit starter's lib/ (providers.ts, wire.ts
-// copied verbatim from the starter kit — kit files, not an old entry).
+// Candidates are the brief's free models meeting the prompt's requirements,
+// ranked by the brief's rating_milli DESC (quality is 60% of the score).
+// The entry dials the best candidate; on a TRANSIENT refusal (429 / 5xx /
+// network error) it retries the SAME model once; on a DEAD signal (message
+// "budget is spent" / "is out", or a 400) it skips that model for the trial;
+// then the next-best candidate; at most 8 attempts per prompt. Every failed
+// attempt is recorded in the x-makefun-upstream-failures header (JSON array
+// of {status, code, model}) so the failover column can be scored. Streams
+// are buffered fully, then re-emitted canonically (the wire helpers), so
+// frame order and usage stay intact.
 //
-// POLICY A (retained from the agg-01 A/B/C experiment, adapted to agg-02):
-//   - candidates = free models meeting the prompt's requirements, ranked by
-//     the brief's rating_milli DESC (quality is 60% of the score);
-//   - dial the best candidate; on a TRANSIENT refusal (429 / 5xx / network
-//     error) retry the SAME model once; on a DEAD signal (message "budget
-//     is spent" / "is out", or a 400) skip that model for the trial;
-//   - then the next-best candidate; at most 8 attempts per prompt;
-//   - every failed attempt is recorded in the x-makefun-upstream-failures
-//     header (JSON array of {status, code, model}) so the failover column
-//     can be scored;
-//   - streams are buffered fully, then re-emitted canonically (same wire
-//     helpers as the starter), so frame order and usage stay intact.
-//
-// DIFFERENCES vs the real submission (read REPORT.md before drawing
-// conclusions): the gateway here is a local shim that forwards to Xingchi
-// gpt-6.1-sol and rewrites the `model` field to the dialed OpenRouter id.
-// The dialed id's rating — not Xingchi's — is what the local scorer
-// credits. This practice validates routing, wire fidelity, token echo,
-// failover handling and the scoring path. It does NOT validate model
-// quality against the real OpenRouter free models, and it does NOT prove
-// the graded score: grading runs on make.fun's server with a real
-// OPENROUTER_API_KEY, real rate limits (20/min, 50/day under 10 credits)
-// and real model behaviour.
+// One model is never dialled: thinkingmachines/inkling-2-small:free answers
+// every call with 403 "only available on agentic harnesses", so dialling it
+// burns one of the 8 attempts and one gateway call per prompt for a refusal
+// that can never turn into an answer. It stays in the catalog and in GET
+// /v1/models — the catalog column scores the full fourteen — only routing
+// skips it. With it out of the way a trial makes 6 gateway calls instead
+// of 10, and the tie-break (fewest calls) improves while the served model
+// stays the same: nemotron-3.5-super-vl answered every prompt before, too.
 //
 // Deterministic: no clock, no randomness in decisions; the same gateway
 // answers give the same bytes on a replay (the live model itself is the
@@ -74,6 +66,14 @@ const MIN_ATTEMPT_MS = 3000;
 /** At most 8 trail entries in the failures header (the env's own cap). */
 const MAX_TRAIL = 8;
 
+/**
+ * Models the gateway refuses outright, every time, for this entry: their
+ * 403 is permanent, not a rate limit, so no retry or failover can save
+ * them. Routing skips them before the first dial; the catalog still lists
+ * them, because the catalog column scores the brief's full set.
+ */
+const BLOCKED_MODELS: ReadonlySet<string> = new Set(['openrouter/thinkingmachines/inkling-2-small:free']);
+
 const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
 const PROMPT_FILE = process.env.MAKEFUN_PROMPT_FILE ?? '';
 const GATEWAY_URL = (process.env.OPENAI_BASE_URL ?? '').replace(/\/+$/, '');
@@ -96,11 +96,24 @@ function servedModels(): ServedModel[] {
   return freeModels(brief).map((model) => ({ id: model.id, provider: model.provider, display_name: model.display_name }));
 }
 
-/** Policy A routing: candidates meeting the requirements, best rating first. */
+/** Whether a model may be dialled at all: blocked ids are never candidates. */
+function isRoutable(model: ModelRow): boolean {
+  return !BLOCKED_MODELS.has(model.id);
+}
+
+/** Policy A routing: routable candidates meeting the requirements, best rating first. */
 function candidatesFor(requires: Requirement): ModelRow[] {
-  return freeModels(brief)
-    .filter((model) => meetsRequirements(requires, capabilitiesOf(model)))
-    .sort((a, b) => b.rating_milli - a.rating_milli);
+  const eligible = freeModels(brief).filter((model) => isRoutable(model) && meetsRequirements(requires, capabilitiesOf(model)));
+  return eligible.sort((a, b) => b.rating_milli - a.rating_milli);
+}
+
+/** Whether any message carries an image block: the prompt needs vision. */
+function visionInMessages(messages: unknown): boolean {
+  if (!Array.isArray(messages)) return false;
+  return messages.some((message) => {
+    if (!isRecord(message) || !Array.isArray(message.content)) return false;
+    return message.content.some((block) => isRecord(block) && (block.type === 'image' || block.type === 'image_url'));
+  });
 }
 
 function requirementsFor(body: Json): Requirement {
@@ -111,16 +124,12 @@ function requirementsFor(body: Json): Requirement {
 }
 
 function requirementsFromBody(body: Json): Requirement {
-  const messages = Array.isArray(body.messages) ? body.messages : [];
-  let vision = false;
-  for (const message of messages) {
-    if (!isRecord(message) || !Array.isArray(message.content)) continue;
-    for (const block of message.content) {
-      if (isRecord(block) && (block.type === 'image' || block.type === 'image_url')) vision = true;
-    }
-  }
   const format = isRecord(body.response_format) ? body.response_format.type : undefined;
-  return { tools: Array.isArray(body.tools) && body.tools.length > 0, vision, json: format === 'json_object' || format === 'json_schema' };
+  return {
+    tools: Array.isArray(body.tools) && body.tools.length > 0,
+    vision: visionInMessages(body.messages),
+    json: format === 'json_object' || format === 'json_schema',
+  };
 }
 
 async function readJson(req: IncomingMessage): Promise<Json | null> {
@@ -141,10 +150,29 @@ async function readJson(req: IncomingMessage): Promise<Json | null> {
   }
 }
 
+/** The failures header for a trail, or nothing when the trail is empty. */
+function failureHeaders(trail: TrailEntry[]): Record<string, string> {
+  if (trail.length === 0) return {};
+  return { 'x-makefun-upstream-failures': JSON.stringify(trail.slice(0, MAX_TRAIL)) };
+}
+
+/** The headers of a streamed answer: SSE, no cache, keep-alive, plus the failures trail. */
+function streamHeaders(trail: TrailEntry[]): Record<string, string> {
+  return {
+    'content-type': 'text/event-stream',
+    'cache-control': 'no-cache',
+    connection: 'keep-alive',
+    ...failureHeaders(trail),
+  };
+}
+
 function sendJson(res: ServerResponse, status: number, body: unknown, trail: TrailEntry[] = []): void {
   const text = JSON.stringify(body);
-  const headers: Record<string, string> = { 'content-type': 'application/json', 'content-length': String(Buffer.byteLength(text)) };
-  if (trail.length > 0) headers['x-makefun-upstream-failures'] = JSON.stringify(trail.slice(0, MAX_TRAIL));
+  const headers: Record<string, string> = {
+    'content-type': 'application/json',
+    'content-length': String(Buffer.byteLength(text)),
+    ...failureHeaders(trail),
+  };
   res.writeHead(status, headers);
   res.end(text);
 }
@@ -156,8 +184,8 @@ function sendError(res: ServerResponse, wire: 'openai' | 'anthropic', status: nu
 
 function models(req: IncomingMessage, res: ServerResponse): void {
   const list = servedModels();
-  if (typeof req.headers['x-api-key'] === 'string') sendJson(res, 200, anthropicModelList(list));
-  else sendJson(res, 200, openAIModelList(list));
+  const shape = typeof req.headers['x-api-key'] === 'string' ? anthropicModelList(list) : openAIModelList(list);
+  sendJson(res, 200, shape);
 }
 
 interface TrailEntry {
@@ -175,16 +203,25 @@ interface Served {
   trail: TrailEntry[];
 }
 
+/** One gateway dial, classified: served, timed out, unreachable, or refused with its code and fate. */
+type DialResult =
+  | { outcome: 'served'; upstream: Response }
+  | { outcome: 'timeout' }
+  | { outcome: 'unreachable'; detail: string }
+  | { outcome: 'refused'; status: number; code: string; dead: boolean; retryable: boolean };
+
 /** The error code of a gateway error body: error.code, else error.type, else ''. */
 function errorCodeOf(text: string): string {
+  let value: unknown;
   try {
-    const value: unknown = JSON.parse(text);
-    if (isRecord(value) && isRecord(value.error)) {
-      if (typeof value.error.code === 'string' && value.error.code !== '') return value.error.code.slice(0, 64);
-      if (typeof value.error.type === 'string' && value.error.type !== '') return value.error.type.slice(0, 64);
-    }
+    value = JSON.parse(text);
   } catch {
-    // Not JSON: fall through to the message match.
+    return '';
+  }
+  if (!isRecord(value) || !isRecord(value.error)) return '';
+  for (const key of ['code', 'type']) {
+    const field = value.error[key];
+    if (typeof field === 'string' && field !== '') return field.slice(0, 64);
   }
   return '';
 }
@@ -195,8 +232,46 @@ function isDeadRefusal(status: number, text: string): boolean {
   return /budget is spent/i.test(text) || /\bis out\b/i.test(text);
 }
 
+/** A refusal is TRANSIENT when it is a rate limit or a server error: worth one retry of the same model. */
 function isTransient(status: number): boolean {
   return status === 429 || (status >= 500 && status <= 599);
+}
+
+/**
+ * One dial of the gateway for one candidate: the request carries the
+ * candidate's id, and the answer is classified on the spot so the caller
+ * only decides served / skip / retry-same. A timeout is its own outcome:
+ * a timed-out model is likely still slow, so the caller skips it instead
+ * of retrying it.
+ */
+async function dialOnce(pick: ModelRow, body: Json, timeoutMs: number): Promise<DialResult> {
+  const headers: Record<string, string> = {
+    'content-type': 'application/json',
+    authorization: `Bearer ${GATEWAY_KEY}`,
+  };
+  if (body.stream === true) headers.accept = 'text/event-stream';
+  let upstream: Response;
+  try {
+    upstream = await fetch(chatCompletionsUrl(), {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ ...body, model: pick.id }),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+  } catch (err) {
+    if ((err as Error).name === 'TimeoutError') return { outcome: 'timeout' };
+    return { outcome: 'unreachable', detail: (err as Error).message };
+  }
+  if (upstream.ok && upstream.body !== null) return { outcome: 'served', upstream };
+  const text = await upstream.text().catch(() => '');
+  const code = errorCodeOf(text) || (isTransient(upstream.status) ? 'rate_limit' : 'upstream_error');
+  return {
+    outcome: 'refused',
+    status: upstream.status,
+    code,
+    dead: isDeadRefusal(upstream.status, text),
+    retryable: isTransient(upstream.status),
+  };
 }
 
 /**
@@ -223,52 +298,36 @@ async function serve(body: Json, requires: Requirement): Promise<Served | null> 
     }
     const timeoutMs = Math.min(UPSTREAM_TIMEOUT_MS, remaining);
     attempts += 1;
-    let upstream: Response;
-    try {
-      const headers: Record<string, string> = {
-        'content-type': 'application/json',
-        authorization: `Bearer ${GATEWAY_KEY}`,
-      };
-      if (body.stream === true) headers.accept = 'text/event-stream';
-      upstream = await fetch(chatCompletionsUrl(), {
-        method: 'POST',
-        headers,
-        body: JSON.stringify({ ...body, model: pick.id }),
-        signal: AbortSignal.timeout(timeoutMs),
-      });
-    } catch (err) {
-      if ((err as Error).name === 'TimeoutError') {
-        // A timed-out model is likely still slow: skip it and try the next
-        // candidate inside the env's 30 s budget, instead of retrying same.
-        trail.push({ status: 504, code: 'upstream_timeout', model: pick.id });
-        log(`attempt ${attempts}: ${pick.id} timed out after ${timeoutMs} ms; skipping`);
-        skipped.add(pick.id);
-        continue;
-      }
+    const result = await dialOnce(pick, body, timeoutMs);
+    if (result.outcome === 'served') return { upstream: result.upstream, model: pick.id, trail };
+    if (result.outcome === 'timeout') {
+      // A timed-out model is likely still slow: skip it and try the next
+      // candidate inside the env's 30 s budget, instead of retrying same.
+      trail.push({ status: 504, code: 'upstream_timeout', model: pick.id });
+      log(`attempt ${attempts}: ${pick.id} timed out after ${timeoutMs} ms; skipping`);
+      skipped.add(pick.id);
+      continue;
+    }
+    if (result.outcome === 'unreachable') {
       // Network error: transient. Retry the same model once, then skip it.
       trail.push({ status: 502, code: 'upstream_unreachable', model: pick.id });
-      log(`attempt ${attempts}: ${pick.id} unreachable (${(err as Error).message}); ${retriedSame.has(pick.id) ? 'skipping' : 'retrying same'}`);
+      log(`attempt ${attempts}: ${pick.id} unreachable (${result.detail}); ${retriedSame.has(pick.id) ? 'skipping' : 'retrying same'}`);
       if (retriedSame.has(pick.id)) skipped.add(pick.id);
       else retriedSame.add(pick.id);
       continue;
     }
-    if (upstream.ok && upstream.body !== null) {
-      return { upstream, model: pick.id, trail };
-    }
-    const text = await upstream.text().catch(() => '');
-    const code = errorCodeOf(text) || (isTransient(upstream.status) ? 'rate_limit' : 'upstream_error');
-    trail.push({ status: upstream.status, code, model: pick.id });
-    if (isDeadRefusal(upstream.status, text)) {
-      log(`attempt ${attempts}: ${pick.id} dead (HTTP ${upstream.status} ${code}); skipping`);
+    trail.push({ status: result.status, code: result.code, model: pick.id });
+    if (result.dead) {
+      log(`attempt ${attempts}: ${pick.id} dead (HTTP ${result.status} ${result.code}); skipping`);
       skipped.add(pick.id);
       continue;
     }
-    if (isTransient(upstream.status) && !retriedSame.has(pick.id)) {
-      log(`attempt ${attempts}: ${pick.id} transient (HTTP ${upstream.status} ${code}); retrying same`);
+    if (result.retryable && !retriedSame.has(pick.id)) {
+      log(`attempt ${attempts}: ${pick.id} transient (HTTP ${result.status} ${result.code}); retrying same`);
       retriedSame.add(pick.id);
       continue;
     }
-    log(`attempt ${attempts}: ${pick.id} refused (HTTP ${upstream.status} ${code}); skipping`);
+    log(`attempt ${attempts}: ${pick.id} refused (HTTP ${result.status} ${result.code}); skipping`);
     skipped.add(pick.id);
   }
   return { upstream: null, model: null, trail };
@@ -289,9 +348,7 @@ async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
   if (body.stream === true) {
     const frames: string[] = [];
     for await (const frame of openAIStreamWithModel(upstream.body, model)) frames.push(frame);
-    const headers: Record<string, string> = { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' };
-    if (trail.length > 0) headers['x-makefun-upstream-failures'] = JSON.stringify(trail.slice(0, MAX_TRAIL));
-    res.writeHead(200, headers);
+    res.writeHead(200, streamHeaders(trail));
     for (const frame of frames) res.write(frame);
     res.end();
     return;
@@ -318,9 +375,7 @@ async function messages(req: IncomingMessage, res: ServerResponse): Promise<void
   if (body.stream === true) {
     const events: string[] = [];
     for await (const event of anthropicEventsFromOpenAI(upstream.body, model)) events.push(event);
-    const headers: Record<string, string> = { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' };
-    if (trail.length > 0) headers['x-makefun-upstream-failures'] = JSON.stringify(trail.slice(0, MAX_TRAIL));
-    res.writeHead(200, headers);
+    res.writeHead(200, streamHeaders(trail));
     for (const event of events) res.write(event);
     res.end();
     return;
@@ -329,17 +384,26 @@ async function messages(req: IncomingMessage, res: ServerResponse): Promise<void
   sendJson(res, 200, openAIToAnthropic(isRecord(answer) ? answer : {}, model), trail);
 }
 
+/** The route of a request: 'models', 'chat' or 'messages', or null when the entry serves no such route. */
+function routeOf(method: string | undefined, pathname: string): 'models' | 'chat' | 'messages' | null {
+  if (method === 'GET' && pathname === '/v1/models') return 'models';
+  if (method === 'POST' && pathname === '/v1/chat/completions') return 'chat';
+  if (method === 'POST' && pathname === '/v1/messages') return 'messages';
+  return null;
+}
+
 async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const url = new URL(req.url ?? '/', 'http://entry');
-  if (req.method === 'GET' && url.pathname === '/v1/models') {
+  const route = routeOf(req.method, url.pathname);
+  if (route === 'models') {
     models(req, res);
     return;
   }
-  if (req.method === 'POST' && url.pathname === '/v1/chat/completions') {
+  if (route === 'chat') {
     await chat(req, res);
     return;
   }
-  if (req.method === 'POST' && url.pathname === '/v1/messages') {
+  if (route === 'messages') {
     await messages(req, res);
     return;
   }
@@ -367,25 +431,26 @@ async function register(port: number, report: CatalogReport): Promise<void> {
 
 function poll(server: Server): void {
   let inFlight = false;
-  const timer = setInterval(() => {
+  const tick = async (): Promise<void> => {
     if (inFlight) return;
     inFlight = true;
-    void (async () => {
-      try {
-        const res = await fetch(`${ENV_URL}/work`, { signal: AbortSignal.timeout(2000) });
-        if (res.status !== 200) return;
-        const work: unknown = await res.json();
-        if (isRecord(work) && work.done === true) {
-          clearInterval(timer);
-          server.close();
-          process.exit(0);
-        }
-      } catch {
-        // The env is not reachable yet: try again on the next tick.
-      } finally {
-        inFlight = false;
+    try {
+      const res = await fetch(`${ENV_URL}/work`, { signal: AbortSignal.timeout(2000) });
+      if (res.status !== 200) return;
+      const work: unknown = await res.json();
+      if (isRecord(work) && work.done === true) {
+        clearInterval(timer);
+        server.close();
+        process.exit(0);
       }
-    })();
+    } catch {
+      // The env is not reachable yet: try again on the next tick.
+    } finally {
+      inFlight = false;
+    }
+  };
+  const timer = setInterval(() => {
+    void tick();
   }, POLL_INTERVAL_MS);
 }
 
